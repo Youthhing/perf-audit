@@ -1,0 +1,30 @@
+# .gstack-perf.yaml — perf-audit configuration
+# Copy this file to your project root and rename to .gstack-perf.yaml
+# Add .gstack-perf.yaml to your .gitignore (contains DB credentials)
+
+# ── DB Connection ──────────────────────────────────────────────────────────────
+
+db_name: "myapp_dev"           # (required) Database name to audit
+
+db_user: "root"                # DB username
+db_password: ""                # DB password — or use env var: PERF_DB_PASSWORD
+
+# Docker MySQL (recommended for local dev)
+# If set, perf-audit uses `docker exec {container} mysql ...`
+# Leave empty to use direct TCP connection instead
+docker_container: "mysql8"    # e.g. "mysql8", "my-mysql-container"
+
+# Direct TCP connection (only used when docker_container is empty)
+db_host: "127.0.0.1"
+db_port: 3306
+
+# ── Audit Settings ─────────────────────────────────────────────────────────────
+
+slow_query_ms: 500             # Flag queries slower than this (milliseconds)
+                               # Lower to 100 if your DB has little traffic yet
+top_n_queries: 10              # Analyze top N slowest queries
+
+# ── Framework ─────────────────────────────────────────────────────────────────
+
+framework: "spring"            # Fix code generation target
+                               # Options: spring | django | rails | fastapi
