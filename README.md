@@ -129,33 +129,35 @@ Spring 프로젝트 디렉토리에서 Claude Code를 열고:
 
 ## 실제 분석 예시
 
-`QuestionSet` 목록 조회 API에서 발견된 N+1:
+실제 Spring Boot 프로젝트(mait)에서 실행한 결과입니다.
 
 ```
 📊 쿼리 분석 결과:
-  총 3개 쿼리 | ⚠️ N+1 의심 1개 | 🔴 Full Scan 의심 1개 | ✅ 정상 1개
+  총 4개 쿼리 | ⚠️ N+1 의심 1개 | ✅ 정상 3개
+
+--- [Step 5] EXPLAIN ANALYZE: N+1 쿼리 ---
+-> Index lookup on questions using uk_question_set_number (question_set_id=1)
+   (cost=1.2 rows=7) (actual time=0.04..0.49 rows=7 loops=1)
 ```
 
+N+1 발견: `questions WHERE question_set_id = ?` 가 **12회** 개별 실행.
+
 ```
-### ⚠️ N+1 감지: `questions.question_set_id = ?` (6회 실행)
+### ⚠️ N+1 감지: `questions.question_set_id = ?` (12회 실행)
 
-문제: QuestionSetEntity 목록을 로딩할 때 각 세트의 questions를
-      건당 개별 쿼리로 조회합니다. 세트가 N개면 N+1번 쿼리가 실행됩니다.
+호출 위치:
+  - QuestionControlService.java:96
+  - QuestionSetService.java:163
+  - QuestionService.java:145
 
-수정 방법 A — @EntityGraph (권장)
-```java
-// QuestionEntityRepository.java
-@EntityGraph(attributePaths = {"questionSet"})
-List<QuestionEntity> findByQuestionSetId(Long questionSetId);
-```
+// Before (N+1 — 루프마다 1 쿼리 = 12회):
+questionEntityRepository.findAllByQuestionSetId(questionSetId);
 
-수정 방법 B — JPQL JOIN FETCH
-```java
-@Query("SELECT q FROM QuestionEntity q JOIN FETCH q.questionSet WHERE q.questionSet.id = :id")
-List<QuestionEntity> findByQuestionSetIdWithJoin(@Param("id") Long id);
-```
+// After (1 쿼리):
+questionEntityRepository.findAllByQuestionSetIdIn(questionSetIds);
+// → WHERE question_set_id IN (1, 2, 3) — 이미 레포에 존재!
 
-예상 개선: 6 쿼리 → 1 쿼리 (6배 감소)
+예상 개선: 12 쿼리 → 1 쿼리
 ```
 
 ---

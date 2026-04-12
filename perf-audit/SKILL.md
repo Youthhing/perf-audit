@@ -60,22 +60,29 @@ done
 - `top_n_queries` (default: 10)
 - `framework` (default: spring)
 
-**Build the MySQL command:**
+**Build the MySQL command — define a shell function:**
 
 ```bash
-# Check if docker_container is configured
+# Build mysql function based on config
 if [ -n "{docker_container}" ]; then
-  MYSQL="docker exec {docker_container} mysql -u{db_user} -p{db_password}"
-  MYSQL_DB="docker exec {docker_container} mysql -u{db_user} -p{db_password} {db_name}"
+  mysql_cmd() { docker exec {docker_container} mysql -u{db_user} -p{db_password} "$@" 2>&1; }
+  mysql_db()  { docker exec {docker_container} mysql -u{db_user} -p{db_password} {db_name} "$@" 2>&1; }
 else
-  # Find mysql client
   MYSQL_BIN=$(which mysql 2>/dev/null)
   [ -z "$MYSQL_BIN" ] && MYSQL_BIN=$(ls /opt/homebrew/opt/mysql*/bin/mysql /usr/local/bin/mysql /usr/bin/mysql 2>/dev/null | head -1)
-  [ -z "$MYSQL_BIN" ] && echo "❌ mysql client not found. Install with: brew install mysql-client" && exit 1
-  MYSQL="$MYSQL_BIN -h {db_host} -P {db_port} -u {db_user} -p{db_password}"
-  MYSQL_DB="$MYSQL_BIN -h {db_host} -P {db_port} -u {db_user} -p{db_password} {db_name}"
+  if [ -z "$MYSQL_BIN" ]; then
+    echo "❌ mysql client not found. Install with: brew install mysql-client"
+    exit 1
+  fi
+  mysql_cmd() { "$MYSQL_BIN" -h {db_host} -P {db_port} -u {db_user} -p{db_password} "$@" 2>&1; }
+  mysql_db()  { "$MYSQL_BIN" -h {db_host} -P {db_port} -u {db_user} -p{db_password} {db_name} "$@" 2>&1; }
 fi
+
+# Test the function works
+mysql_cmd -e "SELECT 1;" > /dev/null 2>&1 && echo "✓ MySQL 연결 확인" || echo "❌ MySQL 연결 실패"
 ```
+
+In all subsequent steps, use `mysql_cmd` (no DB selected) and `mysql_db` (with DB selected) instead of `$MYSQL` and `$MYSQL_DB`.
 
 ---
 
@@ -150,7 +157,7 @@ Run each check. Stop with a clear, actionable error if any fail.
 
 **Check 1 — MySQL connection:**
 ```bash
-$MYSQL -e "SELECT VERSION();" 2>&1
+mysql_cmd -e "SELECT VERSION();" 2>&1
 ```
 - Connection refused → "❌ DB 연결 실패. docker_container 설정이 맞는지, 또는 host/port를 확인하세요."
 - 5.x version → "❌ MySQL 8.0+ required for EXPLAIN ANALYZE. Current: {version}. Phase 1을 사용하려면 MySQL 8.0+이 필요합니다."
@@ -158,14 +165,14 @@ $MYSQL -e "SELECT VERSION();" 2>&1
 
 **Check 2 — performance_schema:**
 ```bash
-$MYSQL -e "SELECT VARIABLE_VALUE FROM performance_schema.global_variables WHERE VARIABLE_NAME='performance_schema';" 2>&1
+mysql_cmd -e "SELECT VARIABLE_VALUE FROM performance_schema.global_variables WHERE VARIABLE_NAME='performance_schema';" 2>&1
 ```
 - OFF → "❌ performance_schema 비활성화. MySQL 설정에서 `performance_schema=ON`으로 변경 후 재시작하세요."
 - Success → print "✓ performance_schema ON"
 
 **Check 3 — DB exists:**
 ```bash
-$MYSQL -e "USE {db_name};" 2>&1
+mysql_cmd -e "USE {db_name};" 2>&1
 ```
 - Error → "❌ DB '{db_name}'를 찾을 수 없습니다. db_name 설정을 확인하세요."
 
@@ -176,7 +183,7 @@ Print: "✓ 프리플라이트 완료. 분석 시작합니다."
 ## Step 3: Extract Slow Queries
 
 ```bash
-$MYSQL_DB -e "
+mysql_db -e "
 SELECT
   DIGEST_TEXT,
   COUNT_STAR                              AS exec_count,
@@ -243,24 +250,25 @@ Replace `?` with real sample values from the DB:
 ```bash
 # Extract table name from DIGEST_TEXT
 # For WHERE {col} = ? pattern: get a sample value
-$MYSQL_DB -e "SELECT {col} FROM {table} WHERE {col} IS NOT NULL LIMIT 1;" 2>&1
+mysql_db -e "SELECT {col} FROM {table} WHERE {col} IS NOT NULL LIMIT 1;" 2>&1
 ```
 
 **5b. Check table schema:**
 ```bash
-$MYSQL_DB -e "SHOW CREATE TABLE {table_name};" 2>&1
-$MYSQL_DB -e "SHOW INDEX FROM {table_name};" 2>&1
+mysql_db -e "SHOW CREATE TABLE {table_name};" 2>&1
+mysql_db -e "SHOW INDEX FROM {table_name};" 2>&1
 ```
 
 **5c. Run EXPLAIN ANALYZE with timeout guard:**
 ```bash
-$MYSQL_DB --max_statement_time=10000 -e "
-EXPLAIN ANALYZE
-{reconstructed_sql};
+mysql_db -e "
+SET SESSION max_execution_time=10000;
+EXPLAIN ANALYZE {reconstructed_sql}\G
 " 2>&1
 ```
 
-If timeout (10s): "⏱️ EXPLAIN ANALYZE 타임아웃 — 쿼리가 복잡합니다. 스킵하고 다음 쿼리로."
+`max_execution_time=10000` = 10초 (밀리초). 초과 시 MySQL이 에러 반환:
+- "max_execution_time exceeded" 메시지 → "⏱️ EXPLAIN ANALYZE 타임아웃. 쿼리가 복잡합니다. 스킵하고 다음 쿼리로."
 
 **5d. Parse EXPLAIN ANALYZE output:**
 
@@ -414,7 +422,7 @@ Print to terminal too. End with:
 ## Step R: Reset (--reset argument)
 
 ```bash
-$MYSQL -e "TRUNCATE TABLE performance_schema.events_statements_summary_by_digest;" 2>&1
+mysql_cmd -e "TRUNCATE TABLE performance_schema.events_statements_summary_by_digest;" 2>&1
 echo "✓ performance_schema 초기화 완료."
 echo "이제 서버를 실행하고 API를 호출한 뒤 /perf-audit을 다시 실행하세요."
 ```
