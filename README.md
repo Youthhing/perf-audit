@@ -44,50 +44,63 @@ perf-audit은 Claude Code 스킬로 동작해서, DB에 직접 붙어 `EXPLAIN A
 
 ---
 
-## 설치
+## 설치 (3단계)
 
 ### 1. 스킬 파일 복사
 
 ```bash
 mkdir -p ~/.claude/skills/perf-audit
-curl -o ~/.claude/skills/perf-audit/SKILL.md \
-  https://raw.githubusercontent.com/YOUR_USERNAME/perf-audit/main/perf-audit/SKILL.md
+curl -fsSL https://raw.githubusercontent.com/Youthhing/perf-audit/main/perf-audit/SKILL.md \
+  -o ~/.claude/skills/perf-audit/SKILL.md
 ```
 
-또는 클론 후 복사:
+### 2. Claude Code에 등록
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/perf-audit.git
-mkdir -p ~/.claude/skills/perf-audit
-cp perf-audit/perf-audit/SKILL.md ~/.claude/skills/perf-audit/SKILL.md
+cat >> ~/.claude/CLAUDE.md << 'EOF'
+
+# perf-audit
+
+When the user types `/perf-audit` (with any arguments like `--phase1`, `--reset`, `--sql "..."`),
+read the skill file at `~/.claude/skills/perf-audit/SKILL.md` and follow its instructions exactly.
+
+- `/perf-audit` — MySQL API 성능 감사 (N+1 감지, EXPLAIN ANALYZE, JPA fix 제안)
+- `/perf-audit --reset` — performance_schema 초기화
+- `/perf-audit --sql "SELECT ..."` — 특정 SQL 직접 분석
+EOF
 ```
 
-### 2. Claude Code에 스킬 등록
+> `~/.claude/CLAUDE.md`는 Claude Code가 모든 프로젝트에서 항상 읽는 전역 설정 파일입니다.
+> 한 번만 등록하면 어떤 프로젝트에서든 `/perf-audit`을 바로 쓸 수 있습니다.
 
-`~/.claude/CLAUDE.md`에 추가:
+### 3. 프로젝트 DB 설정
 
-```markdown
-## Skills
-
-Use the `/perf-audit` skill for API performance auditing (N+1 detection, slow queries).
-Available: `/perf-audit`, `/perf-audit --phase1`, `/perf-audit --reset`, `/perf-audit --sql "..."`
-```
-
-### 3. 프로젝트 설정
-
-Spring 프로젝트 루트에 `.gstack-perf.yaml` 생성:
+Spring 프로젝트 루트에 `.gstack-perf.yaml` 파일을 만듭니다.
 
 ```bash
-cp perf-audit/.gstack-perf.yaml.example /your/project/.gstack-perf.yaml
-# 편집해서 DB 정보 입력
+curl -fsSL https://raw.githubusercontent.com/Youthhing/perf-audit/main/perf-audit/.gstack-perf.yaml.example \
+  -o .gstack-perf.yaml
 ```
 
-또는 `/perf-audit` 처음 실행 시 자동으로 생성해줍니다.
+이후 파일을 열어 DB 정보를 입력하세요.
 
-`.gitignore`에 추가 (자동으로 추가되지만 확인):
+```yaml
+db_name: "myapp_dev"
+db_user: "root"
+db_password: "your_password"
+docker_container: "mysql8"   # Docker로 MySQL 실행 중이면 컨테이너 이름, 아니면 빈 값
 ```
-.gstack-perf.yaml
+
+`.gitignore`에 추가:
+```bash
+echo ".gstack-perf.yaml" >> .gitignore
 ```
+
+> `/perf-audit`을 처음 실행할 때 설정 파일이 없으면 자동으로 생성 마법사가 뜹니다.
+
+---
+
+설치 완료. Claude Code를 **새 세션**으로 열고 프로젝트 디렉토리에서 `/perf-audit` 을 입력하면 됩니다.
 
 ---
 
