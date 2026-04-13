@@ -54,24 +54,11 @@ curl -fsSL https://raw.githubusercontent.com/Youthhing/perf-audit/main/perf-audi
   -o ~/.claude/skills/perf-audit/SKILL.md
 ```
 
-### 2. Claude Code에 등록
+### 2. Claude Code 새 세션 열기
 
-```bash
-cat >> ~/.claude/CLAUDE.md << 'EOF'
+Step 1에서 파일을 `~/.claude/skills/perf-audit/SKILL.md`에 저장했으므로 Claude Code가 자동으로 인식합니다.
 
-# perf-audit
-
-When the user types `/perf-audit` (with any arguments like `--phase1`, `--reset`, `--sql "..."`),
-read the skill file at `~/.claude/skills/perf-audit/SKILL.md` and follow its instructions exactly.
-
-- `/perf-audit` — MySQL API 성능 감사 (N+1 감지, EXPLAIN ANALYZE, JPA fix 제안)
-- `/perf-audit --reset` — performance_schema 초기화
-- `/perf-audit --sql "SELECT ..."` — 특정 SQL 직접 분석
-EOF
-```
-
-> `~/.claude/CLAUDE.md`는 Claude Code가 모든 프로젝트에서 항상 읽는 전역 설정 파일입니다.
-> 한 번만 등록하면 어떤 프로젝트에서든 `/perf-audit`을 바로 쓸 수 있습니다.
+Claude Code를 완전히 종료하고 새 세션으로 여세요. 이미 실행 중이라면 재시작이 필요합니다.
 
 ### 3. 프로젝트 DB 설정
 
