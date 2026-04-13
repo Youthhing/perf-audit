@@ -147,6 +147,145 @@ Use AskUserQuestion (single call, two questions):
 > - B) PR 전 전체 성능 기준선 확인
 > - C) 특정 API가 느린 이유 파악
 
+Store as `BRIEF_FEATURE`, `BRIEF_PURPOSE`.
+
+Extract domain keywords from Q1 answer for Phase 0:
+- "문제 세트 로딩" → `BRIEF_DOMAIN="question_set,question"`
+- "유저 피드 조회" → `BRIEF_DOMAIN="user,feed,post"`
+- 모르겠으면 모든 Entity 스캔
+
+---
+
+## Step 1.5: Phase 0 — Test Data Setup
+
+> 이 단계는 performance_schema에 의미있는 쿼리 데이터가 쌓이도록
+> DB에 더미 데이터를 삽입합니다. 감사 완료 후 자동으로 삭제됩니다.
+
+**1a. Orphan cleanup 파일 확인:**
+
+```bash
+CLEANUP_FILE="$HOME/.gstack/perf-audit-cleanup-${SLUG}-${DB_NAME}.sql"
+```
+
+파일이 존재하면:
+```
+⚠️  이전 실행에서 생성된 더미데이터가 남아 있습니다.
+    파일: $CLEANUP_FILE
+    먼저 정리할까요?
+```
+→ 사용자 동의 시: `mysql_db < "$CLEANUP_FILE" 2>&1` 실행 후 파일 삭제
+→ 거부 시: 경고 표시 후 계속
+
+**1b. DB 권한 확인:**
+
+```bash
+mysql_db -e "SHOW GRANTS FOR CURRENT_USER();" 2>&1
+```
+
+INSERT/DELETE 권한 없으면:
+```
+⚠️  INSERT 권한이 없어 더미데이터를 생성할 수 없습니다.
+    read-only 모드로 진행합니다 (기존 데이터로만 분석).
+
+    권한 부여 방법:
+    GRANT INSERT, DELETE ON {db_name}.* TO '{db_user}'@'%';
+```
+→ read-only 모드로 Step 3으로 진행 (더미 데이터 없이)
+
+**1c. 소스코드 분석 — 비즈니스 맥락 파악:**
+
+`BRIEF_DOMAIN` 키워드를 기반으로 프로젝트 소스에서 관련 Entity 찾기:
+
+```bash
+# Entity 파일 탐색
+find . -name "*Entity*.java" -o -name "*entity*.java" | head -20
+# BRIEF_DOMAIN 키워드와 매칭되는 Entity 우선 선택
+grep -rl "BRIEF_DOMAIN_KEYWORD" src/ --include="*.java" | head -10
+```
+
+각 Entity 파일을 읽어서 파악:
+- 테이블명 (`@Table(name = "...")`)
+- 컬럼 및 타입 (`@Column`)
+- FK 관계 (`@ManyToOne`, `@OneToMany`, `@JoinColumn`)
+- NOT NULL 제약 (`nullable = false`)
+- Enum 타입 (`@Enumerated`)
+- 기본값 (`@Builder.Default`, `@Column(columnDefinition = "...")`)
+
+**1d. INSERT SQL 생성:**
+
+파악한 Entity 구조를 바탕으로 의미있는 더미데이터 INSERT SQL 생성.
+
+규칙:
+- NOT NULL 컬럼은 반드시 값 포함
+- Enum은 해당 Enum 클래스를 읽어서 유효한 값 사용
+- FK는 부모 레코드를 먼저 삽입
+- N+1이 감지되려면 **최소 20개 이상** 레코드 필요 (예: 부모 5개, 자식 4개씩)
+- 더미 식별을 위해 문자열 필드에 `[perf-audit-dummy]` prefix 포함
+- AUTO_INCREMENT PK는 INSERT 후 `LAST_INSERT_ID()`로 ID 수집
+
+**1e. Cleanup 파일에 즉시 기록 (INSERT 전):**
+
+각 INSERT 직전에 cleanup SQL을 파일에 추가:
+
+```bash
+# INSERT 전에 DELETE 구문 먼저 저장
+echo "DELETE FROM {table} WHERE id = LAST_INSERT_ID();" >> "$CLEANUP_FILE"
+# 또는 식별 가능한 경우:
+echo "DELETE FROM {table} WHERE {string_col} LIKE '[perf-audit-dummy]%';" >> "$CLEANUP_FILE"
+```
+
+**1f. INSERT 실행:**
+
+```bash
+mysql_db -e "{generated_insert_sql}" 2>&1
+```
+
+FK 제약 오류 시:
+```
+❌ INSERT 실패: {error}
+   테이블: {table}
+   원인: FK 제약 조건 위반 또는 NOT NULL 누락
+   수동 INSERT SQL:
+   {insert_sql}
+```
+→ 오류 난 테이블 스킵하고 다음 테이블로 계속
+
+**1g. 삽입 완료 후 확인:**
+
+```bash
+mysql_db -e "SELECT COUNT(*) as inserted FROM {main_table} WHERE {string_col} LIKE '[perf-audit-dummy]%';" 2>&1
+```
+
+```
+✓ 더미데이터 생성 완료
+  - {table_a}: {N}개 삽입
+  - {table_b}: {N}개 삽입
+  cleanup 파일: $CLEANUP_FILE
+```
+
+**1h. performance_schema 초기화 (더미 데이터 삽입 전 통계 초기화):**
+
+```bash
+mysql_cmd -e "TRUNCATE TABLE performance_schema.events_statements_summary_by_digest;" 2>&1
+echo "✓ performance_schema 초기화 — 이제부터 실행되는 쿼리만 측정됩니다."
+```
+
+**1i. 더미 데이터로 쿼리 발생시키기:**
+
+삽입된 더미 데이터를 대상으로 분석 대상 테이블의 주요 SELECT 패턴 실행:
+
+```bash
+# 단건 조회 패턴 (N+1 감지용) — 각 ID마다 개별 조회
+for id in $(mysql_db -e "SELECT id FROM {table} WHERE {col} LIKE '[perf-audit-dummy]%' LIMIT 10;" | tail -n +2); do
+  mysql_db -e "SELECT * FROM {related_table} WHERE {fk_col} = $id;" > /dev/null
+done
+
+# 전체 목록 조회 패턴
+mysql_db -e "SELECT * FROM {main_table};" > /dev/null
+```
+
+이 단계가 끝나면 performance_schema에 실제 쿼리 패턴이 쌓임 → Step 3으로 진행.
+
 Store as `BRIEF_FEATURE` and `BRIEF_PURPOSE`.
 
 ---
@@ -416,6 +555,38 @@ Print to terminal too. End with:
 다음:
   수정 적용 → /perf-audit --reset → API 재호출 → /perf-audit (개선 확인)
 ```
+
+---
+
+## Step 7.5: Cleanup Dummy Data
+
+리포트 출력 직후, Phase 0에서 더미데이터를 삽입했다면 cleanup 실행.
+
+```bash
+CLEANUP_FILE="$HOME/.gstack/perf-audit-cleanup-${SLUG}-${DB_NAME}.sql"
+```
+
+파일이 존재하면:
+
+```bash
+echo "🧹 더미데이터 정리 중..."
+mysql_db < "$CLEANUP_FILE" 2>&1
+```
+
+성공 시:
+```
+✓ 더미데이터 정리 완료.
+```
+→ `$CLEANUP_FILE` 삭제
+
+실패 시:
+```
+⚠️  자동 cleanup 실패. 수동으로 실행하세요:
+    mysql -u {db_user} -p {db_name} < $CLEANUP_FILE
+```
+→ 파일은 보존 (다음 실행 시 orphan 감지로 다시 안내)
+
+Phase 0를 건너뛴 경우 (read-only 모드, 더미데이터 없음) → 이 단계 스킵.
 
 ---
 
