@@ -1,11 +1,11 @@
 ---
 name: perf-audit
-version: 0.2.0
+version: 0.3.0
 description: |
-  API performance auditor for MySQL + Spring REST APIs. Detects N+1 queries,
-  slow queries, and missing indexes using EXPLAIN ANALYZE — before you commit.
-  Phase 1: DB Audit (no server needed). Phase 2: k6 HTTP benchmark + worktree A/B (roadmap).
-  Triggers: "성능 확인", "N+1", "쿼리 느려", "perf audit", "slow query", "api benchmark".
+  API performance auditor for Spring REST APIs.
+  Pipeline: Stage A classify APIs (git diff + decision tree) → Stage B k6 load test (roadmap) → Stage C DB audit.
+  Stage C detects N+1 and slow queries with EXPLAIN ANALYZE and suggests JPA fixes.
+  Triggers: "API 분류", "성능 테스트 준비", "부하 테스트", "N+1", "slow query", "perf audit", "api benchmark".
 allowed-tools:
   - Bash
   - Read
@@ -17,17 +17,333 @@ allowed-tools:
 
 # /perf-audit — API Performance Auditor
 
-커밋 전에 실행해서 N+1, 풀 테이블 스캔, 슬로우 쿼리를 잡고 JPA/Spring 수정 제안까지 받는 스킬.
+Spring REST API의 성능을 커밋 전에 점검하기 위한 스킬.
+전체 파이프라인은 **Stage A (분류) → Stage B (k6 부하 테스트) → Stage C (DB audit)**.
+API 유형별로 부하 테스트의 목적과 프리셋이 달라야 하기 때문에, 파이프라인의 앞단에서
+각 API를 분류하는 것이 핵심이다.
 
 ## Argument Routing
 
 Parse the user's invocation:
-- `/perf-audit` or `/perf-audit --phase1` → Phase 1 (DB Audit) — run all steps below
-- `/perf-audit --phase2` → print "Phase 2 (k6 + worktree A/B)는 로드맵 중입니다. Phase 1을 먼저 실행하세요: `/perf-audit`"
-- `/perf-audit --reset` → Reset performance_schema (Step R below), then stop
-- `/perf-audit --sql "<SQL>"` → Skip to Step 5 with the provided SQL, skip Steps 3-4
+- `/perf-audit` or `/perf-audit --classify` → **Stage A (분류)** 실행 — 아래 Stage A 섹션의 모든 단계
+- `/perf-audit --k6` → "Stage B (k6 부하 테스트)는 로드맵 중입니다. 먼저 분류를 실행하세요: `/perf-audit`"
+- `/perf-audit --db` or `/perf-audit --phase1` → **Stage C (DB Audit)** 실행 — 기존 DB audit 워크플로우 (Stage C 섹션 전체)
+- `/perf-audit --all` → "분류 → k6 → DB audit 파이프라인 자동 실행은 로드맵 중입니다. 현재는 단계별로 실행해주세요."
+- `/perf-audit --reset` → Reset performance_schema (Stage C의 Step R), then stop
+- `/perf-audit --sql "<SQL>"` → Stage C의 Step 5로 바로 진입, Step 3-4 스킵
 
 ---
+
+# Stage A: API Classification
+
+목표: 변경된 API 후보를 자동 추출하고 사용자 검증을 거친 뒤, 각 API에 결정 트리를
+적용해 7개 기본 패턴 × 2개 플래그로 분류한다. 이 분류 결과는 이후 Stage B(k6)가
+패턴별 시나리오 프리셋을 선택하는 입력이 된다.
+
+이번 버전에서는 **분류 단계의 산출물(Markdown 리포트)까지만** 생성한다.
+k6 스크립트 자동 생성과 Stage C 연동은 로드맵.
+
+## Step A-1: API Discovery from Git Diff
+
+변경된 Controller/Service 파일에서 엔드포인트 후보를 추출한다.
+
+```bash
+# 1차: 브랜치 vs main 비교
+CANDIDATES=$(git diff main...HEAD --name-only 2>/dev/null \
+  | grep -E '(Controller|Service)\.(java|kt)$')
+
+# 2차: staged + unstaged
+if [ -z "$CANDIDATES" ]; then
+  CANDIDATES=$( (git diff --name-only; git diff --cached --name-only) \
+    | sort -u | grep -E '(Controller|Service)\.(java|kt)$')
+fi
+
+# 3차 (fallback): 최근 5개 커밋
+if [ -z "$CANDIDATES" ]; then
+  CANDIDATES=$(git log -5 --name-only --pretty=format: \
+    | sort -u | grep -E '(Controller|Service)\.(java|kt)$')
+fi
+
+echo "후보 파일:"
+echo "$CANDIDATES"
+```
+
+각 Controller 파일에서 HTTP 엔드포인트 추출 (Grep 사용):
+- `@GetMapping` / `@PostMapping` / `@PutMapping` / `@PatchMapping` / `@DeleteMapping`
+- `@RequestMapping(method = RequestMethod.XXX, ...)`
+- 클래스 레벨 `@RequestMapping("/base/path")`과 메서드 레벨 path를 합쳐 **full path** 구성
+
+각 후보를 다음 형태로 수집:
+```
+HTTP | fullPath | controllerFile:line | methodName
+```
+
+**후보 0개인 경우:**
+```
+ℹ️  변경된 Controller/Service가 없습니다.
+    특정 API를 직접 입력하면 분류해드립니다. (예: GET /api/users/{id})
+```
+→ AskUserQuestion으로 수동 입력 요청 후 Step A-2로 이동. 입력도 없으면 종료.
+
+## Step A-2: User Validation
+
+추출한 후보 목록을 AskUserQuestion으로 검증받는다.
+
+```
+> 이 API들을 분류할까요? 체크 해제하면 제외, "Other"로 다른 API 추가 가능.
+>
+> [x] GET  /api/questions/{id}   (QuestionController.java:45 — getQuestion)
+> [x] POST /api/questions         (QuestionController.java:60 — createQuestion)
+> [x] PUT  /api/questions/{id}    (QuestionController.java:80 — updateQuestion)
+```
+
+- multiSelect=true로 기본 전체 선택 상태 제시
+- 사용자가 "Other"로 입력한 API 경로는 Grep으로 실제 Controller 메서드를 찾아 합류
+  - 찾지 못하면 "⚠️ {path}에 해당하는 Controller 메서드를 찾지 못했습니다. 직접 파일 경로를 지정해주세요."
+
+사용자가 다른 API 분석을 원할 수 있음을 명시적으로 허용한다 —
+git diff 기반 추출은 "출발점"일 뿐, 분류 대상 결정권은 사용자에게 있다.
+
+## Step A-3: Per-API Source Trace
+
+선택된 각 API에 대해 분류에 필요한 정보를 수집한다.
+
+1. **Controller 메서드** 본문 읽기 (Read)
+   - 메서드 시그니처: HTTP 어노테이션, `@PathVariable`, `@RequestParam`, `@RequestBody`, `@ModelAttribute`
+   - 반환 타입: `Page<T>` / `Slice<T>` / `List<T>` / `Optional<T>` / 단일 DTO / `SseEmitter` / `Flux` / `ResponseBodyEmitter`
+   - 서비스 호출 식별 (의존성 + 메서드명)
+
+2. **Service 메서드** 본문 읽기
+   - 클래스 레벨 + 메서드 레벨 `@Transactional(readOnly = ?)` 확인
+   - `@Async`, `@Scheduled` 존재 여부
+   - 호출하는 Repository 목록 (서로 다른 인스턴스 수)
+   - 호출하는 다른 Service 컴포넌트
+   - 외부 호출 흔적: `RestTemplate`, `WebClient`, `RestClient`, `@FeignClient`, AWS SDK
+   - `saveAll` / `deleteAll` / `save` / `delete` / `@Modifying @Query` 호출
+
+3. **Repository 인터페이스** 스캔 (Aggregation 판정용)
+   - `@Query` 내 `GROUP BY`/`COUNT(`/`SUM(`/`AVG(`/`MIN(`/`MAX(`
+   - 메서드명 패턴: `count*` / `sum*` / `get*Stats` / `get*Summary` / `aggregate*`
+   - `Specification` / QueryDSL 사용 여부 (Search Read 판정용)
+
+Grep 예시:
+```bash
+# Controller → Service 체인 추적
+grep -rn "class {ControllerName}" --include="*.java" --include="*.kt"
+grep -n "{serviceMethodName}(" <service_file>
+
+# External call 감지
+grep -rn "RestTemplate\|WebClient\|RestClient\|@FeignClient" <service_files>
+```
+
+## Step A-4: Classify (Decision Tree)
+
+**원칙:** 아래 표들을 **위에서부터 순서대로** 적용한다. 먼저 매치되는 분류로 확정.
+모든 API는 "7개 기본 패턴 중 하나 + 0~2개 플래그" 또는 "SKIP/UNSUPPORTED"로 단일 분류된다.
+
+### 0. 사전 제외 필터 (SKIP/UNSUPPORTED)
+
+| 조건 | 판정 | 사유 |
+|---|---|---|
+| `@Async` 어노테이션 존재 | SKIP | 응답시간 측정 무의미 |
+| `@Scheduled` 어노테이션 존재 | SKIP | API 아님 |
+| 반환 타입이 `SseEmitter` / `ResponseBodyEmitter` / `Flux`(SSE 용도) | UNSUPPORTED | 측정 패러다임 다름 |
+| `WebSocketHandler` 구현체 | UNSUPPORTED | 측정 패러다임 다름 |
+| 메서드 본문이 `kafkaTemplate.send()` / `rabbitTemplate.convertAndSend()` 호출만 | SKIP | 큐 발행 전용 |
+
+해당되지 않으면 1단계로.
+
+### 1. 1차 분류: 읽기 vs 쓰기
+
+| 판정 | 조건 (둘 중 하나라도 해당) |
+|---|---|
+| **쓰기** | • HTTP가 `POST`/`PUT`/`PATCH`/`DELETE`<br>• `@Transactional`(readOnly=false 또는 속성 없음)<br>• Repository의 `save`/`delete`/`@Modifying @Query` 호출 |
+| **읽기** | • HTTP가 `GET`<br>• `@Transactional(readOnly = true)`<br>• 상태 변경 쿼리 없음 |
+
+**예외 규칙:**
+- `POST`지만 상태 변경 쿼리 부재 + 반환값이 조회 결과 → **읽기로 재분류** (검색 조건 전달용 POST)
+- `GET`이지만 카운터 증가 같은 부수 쓰기 있음 → **쓰기로 분류**
+
+### 2. 읽기 세부 분류 (우선순위: Aggregation > Search > List > Single)
+
+| 순위 | 패턴 | 판정 조건 | 예시 |
+|---|---|---|---|
+| 1 | **Aggregation** | `@Query`에 `GROUP BY`/`COUNT(`/`SUM(`/`AVG(`/`MIN(`/`MAX(` **또는** 메서드명 `count*`/`sum*`/`get*Stats`/`get*Summary`/`aggregate*` **또는** 반환 DTO 필드 과반이 숫자형 | `GET /orders/stats?from=...` |
+| 2 | **Search Read** | `@RequestParam` 3개 이상 **또는** `@ModelAttribute` 검색 DTO **또는** Specification/QueryDSL **또는** 메서드명 `search*`/`find*By*And*By*` | `GET /products?category=...&price=...&sort=...` |
+| 3 | **List Read** | 반환 타입 `Page<T>`/`Slice<T>`/`List<T>` **또는** `Pageable` 파라미터 | `GET /products`, `GET /users/{id}/orders` |
+| 4 | **Single Read** | 위 3개 미해당 (기본값) — 반환 타입 단일 엔티티/`Optional<T>`/단일 DTO, `@PathVariable` 식별자 | `GET /users/{id}` |
+
+### 3. 쓰기 세부 분류 (우선순위: Delete > Bulk > Single)
+
+| 순위 | 패턴 | 판정 조건 | 예시 |
+|---|---|---|---|
+| 1 | **Delete** | HTTP가 `DELETE` **또는** 메서드명 `delete*`/`remove*` | `DELETE /users/{id}` |
+| 2 | **Bulk Write** | `@RequestBody`가 `List<T>`/`Collection<T>`/배열 **또는** 메서드명 `bulk*`/`batch*`/`*All` **또는** `saveAll()`/`deleteAll()` | `POST /products/bulk` |
+| 3 | **Single Write** | 위 2개 미해당 (기본값) — `@RequestBody` 단일 DTO, 단일 엔티티 대상 | `POST /users`, `PUT /products/{id}` |
+
+### 4. 플래그 판정 (독립, 중복 가능)
+
+#### 🔶 Composite 플래그
+
+**부여 조건 (모두 만족):**
+- 쓰기 계열 패턴 (Single Write / Bulk Write / Delete)
+- 서비스 메서드에 `@Transactional` 존재
+- 다음 중 하나:
+  - 서로 다른 2개 이상 Repository 호출
+  - 다른 Service 컴포넌트 호출 (Service 간 의존성)
+  - 단일 메서드 내에서 2개 이상 테이블에 쓰기
+
+**제외 (Composite 미부여):**
+- cascade로만 자동 쓰기 발생
+- 감사 로그(audit log) 같은 AOP 기반 부수 쓰기
+- `findById` → `save` 1개 테이블 대상 "조회 후 수정"
+
+#### 🔷 External Call 플래그
+
+**부여 조건 (하나라도 해당):**
+- `RestTemplate` / `WebClient` / `RestClient` 주입 또는 사용
+- `@FeignClient` 인터페이스 주입
+- AWS SDK 클라이언트 (`S3Client`, `SesClient` 등)
+- 외부 SDK (결제사, SMS 등)
+
+**제외:** S3 **presigned URL 발급만** 하는 경우 (실제 전송 없음).
+
+### 5. 출력 형식
+
+```
+{패턴명} [+ 🔶 Composite] [+ 🔷 External Call]
+
+예시:
+- Single Read
+- List Read
+- Search Read
+- Aggregation
+- Single Write
+- Single Write + 🔶 Composite
+- Single Write + 🔶 Composite + 🔷 External Call
+- Bulk Write + 🔶 Composite
+- Delete + 🔶 Composite
+- SKIP / UNSUPPORTED
+```
+
+### 6. 결정 트리 (의사코드)
+
+```
+classify(controllerMethod, serviceMethod):
+  # 0. 제외 필터
+  if hasAsync or hasScheduled: return SKIP
+  if returnsStreaming or isWebSocket: return UNSUPPORTED
+  if onlyPublishesToQueue: return SKIP
+
+  # 1. 읽기/쓰기
+  isWrite = writeHttpMethod
+         or mutableTransactional
+         or callsWriteRepository
+  # 예외 적용
+  if httpPOST and noStateMutation and returnsQueryResult: isWrite = False
+  if httpGET and hasCounterIncrement:                     isWrite = True
+
+  # 2-3. 세부
+  if isWrite: pattern = Delete > BulkWrite > SingleWrite (우선순위 순)
+  else:       pattern = Aggregation > Search > List > Single
+
+  # 4. 플래그
+  flags = []
+  if isWrite and isComposite: flags.append("Composite")
+  if hasExternalCall:         flags.append("ExternalCall")
+
+  return pattern, flags
+```
+
+### 7. 분류 예시 (참고용)
+
+| 코드 특징 | 분류 |
+|---|---|
+| `GET /users/{id}` → `userRepository.findById(id)` | Single Read |
+| `GET /products?page=0&size=20` → `Page<Product>` | List Read |
+| `GET /products?category=X&minPrice=Y&sort=Z` (파라미터 3+) | Search Read |
+| `GET /orders/revenue?year=2024` → `SUM(amount)` | Aggregation |
+| `POST /users` + `userRepository.save()` 단일 | Single Write |
+| `POST /products/batch` + `saveAll(List<>)` | Bulk Write |
+| `DELETE /users/{id}` | Delete |
+| `POST /orders` (주문 + 재고차감 + 포인트 적립, 3개 테이블) | Single Write + 🔶 Composite |
+| `POST /payments` (외부 PG + 결제 저장) | Single Write + 🔶 Composite + 🔷 External Call |
+| `POST /notifications/send` (Feign으로 외부 알림) | Single Write + 🔷 External Call |
+| `@Scheduled fun syncDaily()` | SKIP |
+| `GET /events/stream` → `SseEmitter` | UNSUPPORTED |
+
+각 API마다 판정 이유를 **한 줄로** 남긴다. 예:
+> `Single Write + 🔶 Composite`: `@Transactional`, PaymentRepo/OrderRepo/PointRepo (3개) 호출
+
+## Step A-5: Output Report
+
+저장 경로: `~/.gstack/perf-audit-classify-{yyyymmdd-HHMMss}.md`
+
+템플릿:
+
+````markdown
+# API Classification
+**브랜치:** {current_branch}
+**기준:** {discovery_source — e.g. "git diff main...HEAD"}
+**분류 대상:** {N}개
+**생성 시각:** {date}
+
+## 요약
+
+| HTTP | Path | 분류 | 플래그 | 근거 |
+|------|------|------|--------|------|
+| GET  | /api/questions/{id} | Single Read  | —                         | @PathVariable + Optional<Question> |
+| POST | /api/questions      | Single Write | 🔶 Composite              | @Transactional, 3개 Repository |
+| POST | /api/payments       | Single Write | 🔶 Composite + 🔷 External | WebClient PG + 결제 저장 |
+| GET  | /api/stats          | Aggregation  | —                         | GROUP BY + COUNT |
+
+## 상세 분류
+
+### POST /api/payments — Single Write + 🔶 Composite + 🔷 External Call
+- **파일:** `PaymentController.java:42` → `PaymentService.requestPayment:88`
+- **판정 근거:**
+  - 1차 — POST + `@Transactional` → 쓰기
+  - 세부 — `@RequestBody PaymentRequest`(단일) → Single Write
+  - 🔶 Composite — PaymentRepo.save + OrderRepo.findById + PointRepo.deduct (3개 Repo)
+  - 🔷 External — WebClient로 PG사 결제 API 호출
+
+### GET /api/stats — Aggregation
+- **파일:** `StatsController.java:18` → `StatsService.getOrderRevenue:24`
+- **판정 근거:**
+  - 1차 — GET + `@Transactional(readOnly=true)` → 읽기
+  - 세부 — `@Query`에 `SUM(amount) GROUP BY month` → Aggregation (우선순위 1)
+
+## 다음 단계 (로드맵)
+
+- [ ] **Stage B** — `/perf-audit --k6`: 패턴별 k6 시나리오 프리셋
+  - Single Read: 고 RPS, 낮은 VU, 짧은 응답 p95 임계
+  - Bulk Write: 낮은 RPS, 높은 VU, TX/락 경합 관측
+  - Aggregation: p95 임계 완화, 쿼리 시간 관측 강화
+  - +Composite: 더 낮은 RPS + 에러율 임계 강화
+  - +External Call: 외부 의존성 mocking 전략 명시
+- [ ] **Stage C** — `/perf-audit --db`: 부하 테스트 중 잡힌 slow query 분석 (기존 DB audit)
+````
+
+리포트 저장 후 터미널 출력:
+```
+📄 분류 리포트: ~/.gstack/perf-audit-classify-{timestamp}.md
+
+✅ Stage A 완료.
+  - 분류된 API: {N}개
+  - SKIP/UNSUPPORTED: {M}개
+
+다음 단계:
+  Stage B (k6 시나리오) — 로드맵 진행 중
+  Stage C (DB audit) — 지금 실행: /perf-audit --db
+```
+
+---
+
+# Stage C: DB Audit
+
+DB-first 감사 워크플로우. `--db` 또는 `--phase1` 인자로 실행된다.
+performance_schema에서 슬로우 쿼리를 추출하고 EXPLAIN ANALYZE를 돌려
+N+1/Full Scan 의심 쿼리에 JPA 수정 코드를 제안한다.
 
 ## Step 0: Load Config
 

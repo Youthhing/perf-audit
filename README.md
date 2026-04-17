@@ -1,9 +1,10 @@
 # perf-audit
 
-**커밋 전에 실행하는 MySQL API 성능 감사 도구.**  
-N+1 쿼리, 풀 테이블 스캔, 슬로우 쿼리를 자동으로 감지하고 JPA/Spring 수정 코드를 제안합니다.
+**Spring REST API 성능 감사 파이프라인.**
+변경된 API를 자동으로 분류해 패턴별 부하 테스트 전략을 세우고, N+1/풀 스캔/슬로우 쿼리까지 잡아 JPA 수정 코드를 제안합니다.
 
-서버 없이 동작합니다. DB 접속 정보만 있으면 됩니다.
+파이프라인: **분류(Stage A) → k6 부하 테스트(Stage B, 로드맵) → DB audit(Stage C)**.
+분류는 서버/DB 없이 소스와 git diff만으로 동작합니다. Stage C는 DB 접속 정보가 필요합니다.
 
 ---
 
@@ -22,17 +23,20 @@ perf-audit은 Claude Code 스킬로 동작해서, DB에 직접 붙어 `EXPLAIN A
 ## 동작 방식
 
 ```
-/perf-audit 실행
-     │
-     ├─ MySQL performance_schema에서 슬로우 쿼리 추출
-     ├─ N+1 패턴 자동 감지 (동일 테이블 반복 단건 조회)
-     ├─ EXPLAIN ANALYZE로 각 쿼리 분석
-     ├─ 소스코드 읽어서 JPA 수정 코드 생성
-     └─ Markdown 리포트 저장
+/perf-audit                          /perf-audit --k6                /perf-audit --db
+(Stage A: 분류)                       (Stage B: k6, 로드맵)           (Stage C: DB audit)
+     │                                        │                                │
+     ├─ git diff로 변경 API 후보 추출          ├─ 패턴별 k6 시나리오 프리셋      ├─ performance_schema 추출
+     ├─ 사용자 검증 (추가/교체 가능)           ├─ Single Read: 고 RPS           ├─ N+1/Full Scan 감지
+     ├─ 결정 트리 적용                         ├─ Bulk Write: TX/락 경합        ├─ EXPLAIN ANALYZE
+     │    · 7 패턴 (Read 4 + Write 3)         ├─ Aggregation: p95 완화         ├─ JPA 수정 코드 제안
+     │    · 2 플래그 (Composite, External)    └─ +Composite/+External 가중치    └─ Markdown 리포트
+     └─ 분류 Markdown 리포트
 ```
 
-**Phase 1 (현재):** DB Audit — 서버 불필요, MySQL 직접 분석  
-**Phase 2 (로드맵):** k6 HTTP 벤치마크 + git worktree A/B 비교
+**Stage A (현재):** API 분류 — git diff + 결정 트리. 서버/DB 불필요
+**Stage B (로드맵):** 패턴별 k6 부하 테스트 프리셋 + 자동 실행
+**Stage C (현재):** DB Audit — performance_schema + EXPLAIN ANALYZE. MySQL 직접 분석
 
 ---
 
@@ -103,26 +107,35 @@ Spring 프로젝트 디렉토리에서 Claude Code를 열고:
 
 ### 커맨드
 
-| 커맨드 | 설명 |
-|--------|------|
-| `/perf-audit` | Phase 1 실행 (DB Audit) |
-| `/perf-audit --phase1` | 위와 동일 |
-| `/perf-audit --reset` | performance_schema 초기화 (API 재호출 전 사용) |
-| `/perf-audit --sql "SELECT ..."` | 특정 SQL 직접 분석 |
+| 커맨드 | Stage | 설명 |
+|--------|-------|------|
+| `/perf-audit` | A | 변경된 API 분류 (기본) |
+| `/perf-audit --classify` | A | 위와 동일 |
+| `/perf-audit --k6` | B | 로드맵 안내 메시지 |
+| `/perf-audit --db` | C | DB Audit (performance_schema → EXPLAIN ANALYZE → JPA fix) |
+| `/perf-audit --phase1` | C | `--db`의 하위 호환 alias |
+| `/perf-audit --reset` | C | performance_schema 초기화 (API 재호출 전 사용) |
+| `/perf-audit --sql "SELECT ..."` | C | 특정 SQL 직접 분석 |
+| `/perf-audit --all` | A→B→C | 파이프라인 자동 실행 (로드맵) |
 
 ### 기본 워크플로우
 
 ```bash
-# 1. API 구현 완료
-# 2. 서버 기동하고 해당 API 몇 번 호출 (또는 테스트 실행)
-# 3. Claude Code에서:
+# 1. API 구현 완료 후 브랜치 push 전
 /perf-audit
+# → 변경된 Controller/Service 추출 → 검증 → 패턴 분류 리포트
 
-# 4. 리포트 확인 + 수정 적용
-# 5. 다시 측정:
+# 2. (로드맵) Stage A 결과로 k6 부하 테스트
+/perf-audit --k6
+
+# 3. 서버 기동하고 API 호출 후 DB audit
+/perf-audit --db
+# → 리포트 확인 + 수정 적용
+
+# 4. 다시 측정:
 /perf-audit --reset
 # → API 재호출
-/perf-audit
+/perf-audit --db
 ```
 
 ---
@@ -208,11 +221,18 @@ A. `EXPLAIN ANALYZE`는 MySQL 8.0+에서만 지원됩니다. MySQL 5.7 지원은
 
 ## 로드맵
 
-- [x] Phase 1: MySQL DB Audit (N+1, Full Scan, EXPLAIN ANALYZE)
-- [ ] Phase 2: k6 HTTP 벤치마크 (사전 워크플로우 + A/B 비교)
+- [x] **Stage A**: API 분류 (git diff + 결정 트리, 7 패턴 + 2 플래그)
+- [x] **Stage C**: MySQL DB Audit (N+1, Full Scan, EXPLAIN ANALYZE)
+- [ ] **Stage B**: 패턴별 k6 시나리오 프리셋
+  - Single Read / Bulk Write / Aggregation 등 유형별 RPS/VU/threshold 차등화
+  - +Composite, +External Call 플래그로 가중치 조정
+- [ ] **Stage A+B+C 파이프라인** 자동 실행 (`--all`)
+- [ ] Stage A → Stage C 연동: 부하 중 잡힌 slow query를 분류된 API와 매핑
+- [ ] git worktree 기반 before/after A/B 비교
 - [ ] MySQL 5.7 EXPLAIN FORMAT=JSON fallback
 - [ ] PostgreSQL 지원
 - [ ] Django/Rails fix 코드 생성
+- [ ] Kotlin Spring 파싱 정확도 개선
 - [ ] GitHub Actions CI 연동 (PR마다 자동 감사)
 
 ---
